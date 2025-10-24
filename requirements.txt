@@ -2,3 +2,4 @@ streamlit
 CoolProp
 numpy
 plotly
+matplotlib.pyplot
