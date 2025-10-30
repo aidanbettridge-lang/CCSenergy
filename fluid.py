@@ -147,4 +147,5 @@ st.plotly_chart(fig, use_container_width=True)
 # FOOTER
 # =====================================
 st.markdown("---")
-st.markdown("© 2025 CCS Energy Pty Ltd. All rights reserved.")
+st.markdown("© 2025 CCS Energy Pty Ltd. All rights reserved. info@ccsenergy.com.au")
+
