@@ -45,10 +45,10 @@ with st.sidebar:
     skin = st.number_input("Skin factor", value=0.0)
     q_tpd = st.number_input("Injection rate (t/d)", value=1000.0)
     perm_mD = st.number_input("Permeability (mD)", value=100.0)
-    poro = st.number_input("Porosity", value=0.25)
     h_res = st.number_input("Reservoir thickness (m)", value=10.0)
     rw = st.number_input("Wellbore radius (m)", value=0.0889)
     re = st.number_input("Drainage radius (m)", value=100.0)
+    n_segments = st.slider("Number of segments", 20, 500, 200, 10)
     show_sensitivity = st.checkbox("Show Rate vs FTHP Sensitivity (±100%)", value=False)
 
 # =====================================
@@ -75,26 +75,43 @@ except:
 # CALCULATION
 # =====================================
 if st.button("Calculate"):
-    # --- Hydrostatic pressures ---
-    # Simple average density approximation
-    rho_static_avg = rho_res
-    rho_flow_avg = rho_res
-    dP_hydro_static = rho_static_avg * G * TVD
-    dP_hydro_flow = rho_flow_avg * G * TVD
 
-    # --- Sandface pressure loss ---
+    # --- Depth nodes ---
+    md_nodes = np.linspace(0, MD, n_segments)
+    tvd_nodes = np.linspace(0, TVD, n_segments)
+    dz_md = np.diff(md_nodes)
+    dz_tvd = np.diff(tvd_nodes)
+
+    # --- Hydrostatic pressures ---
+    # Static hydrostatics (SITHP)
+    SITHP_pa = P_res_pa - rho_res * G * TVD
+
+    # --- Sandface loss ---
     q_vol = mass_flow_kg_s / rho_res
     sandface_loss = (mu_res*q_vol)/(2*pi*perm_m2*h_res)*(log(re/rw)+skin) if (perm_m2>0 and h_res>0) else 0.0
 
-    # --- Friction pressure along tubing ---
-    vel = q_vol / A_tub
-    Re = rho_res * vel * D_tub_m / mu_res
-    f = haaland_friction(Re, eps_m/D_tub_m)
-    dp_friction = f * (MD/D_tub_m) * (rho_res*vel**2/2.0)
+    # --- FLOWING PRESSURE (Bottom-up) ---
+    pressure_flow = np.zeros(n_segments)
+    pressure_flow[-1] = P_res_pa + sandface_loss  # start at reservoir + sandface
 
-    # --- THP calculations ---
-    SITHP_pa = P_res_pa - dP_hydro_static
-    FTHP_pa = P_res_pa + sandface_loss + dp_friction - dP_hydro_flow
+    for i in range(n_segments-2, -1, -1):
+        T_loc = T_surf_K + (T_res_K - T_surf_K) * (tvd_nodes[i+1] / TVD)
+        try:
+            rho_loc = PropsSI('D','T',T_loc,'P',pressure_flow[i+1],'CO2')
+            mu_loc = PropsSI('V','T',T_loc,'P',pressure_flow[i+1],'CO2')
+        except:
+            rho_loc = rho_res
+            mu_loc = mu_res
+
+        vel_loc = q_vol / A_tub
+        Re_loc = rho_loc * vel_loc * D_tub_m / mu_loc
+        f_loc = haaland_friction(Re_loc, eps_m/D_tub_m)
+        dp_friction = f_loc * (dz_md[i]/D_tub_m) * (rho_loc*vel_loc**2 / 2)
+        dp_hydro = rho_loc * G * dz_tvd[i]
+
+        pressure_flow[i] = pressure_flow[i+1] - dp_hydro - dp_friction
+
+    FTHP_pa = pressure_flow[0]
 
     # --- Display results ---
     st.subheader("Results")
@@ -102,18 +119,12 @@ if st.button("Calculate"):
     st.write(f"Flowing THP = {from_pa(FTHP_pa, pressure_unit):.3f} {pressure_unit}")
     st.write(f"ΔTHP = {from_pa(FTHP_pa - SITHP_pa, pressure_unit):.3f} {pressure_unit}")
     st.write(f"Sandface loss = {from_pa(sandface_loss, pressure_unit):.3f} {pressure_unit}")
-    st.write(f"Friction loss = {from_pa(dp_friction, pressure_unit):.3f} {pressure_unit}")
-    st.write(f"Hydrostatic (static) = {from_pa(dP_hydro_static, pressure_unit):.3f} {pressure_unit}")
-    st.write(f"Hydrostatic (flowing) = {from_pa(dP_hydro_flow, pressure_unit):.3f} {pressure_unit}")
 
-    # --- Pressure vs depth (simple linear) ---
-    tvd_nodes = np.linspace(0, TVD, 20)
-    pressure_shut_profile = np.linspace(P_res_pa - dP_hydro_static, P_res_pa, 20)
-    pressure_flow_profile = np.linspace(FTHP_pa - (FTHP_pa-SITHP_pa), FTHP_pa, 20)
-
+    # --- Pressure vs depth plot ---
     fig, ax = plt.subplots(figsize=(5,8))
-    ax.plot(from_pa(pressure_flow_profile, pressure_unit), tvd_nodes, label="Flowing profile", color='blue')
-    ax.plot(from_pa(pressure_shut_profile, pressure_unit), tvd_nodes, '--', label="Shut-in profile", color='red')
+    ax.plot(from_pa(pressure_flow, pressure_unit), tvd_nodes, label="Flowing profile", color='blue')
+    ax.plot(from_pa(np.linspace(P_res_pa - rho_res*G*TVD, P_res_pa, n_segments), pressure_unit),
+            tvd_nodes, '--', label="Shut-in profile", color='red')
     ax.set_xlabel(f"Pressure ({pressure_unit})")
     ax.set_ylabel("TVD (m)")
     ax.invert_yaxis()
@@ -123,16 +134,20 @@ if st.button("Calculate"):
 
     # --- Sensitivity plot ---
     if show_sensitivity:
-        q_vals = np.linspace(0.5*q_tpd, 2.0*q_tpd, 15)
+        q_vals = np.linspace(0.5*q_tpd, 2*q_tpd, 15)
         fthp_vals = []
         for qv in q_vals:
-            q_vol_tmp = qv*1000/86400/rho_res
-            vel_tmp = q_vol_tmp / A_tub
-            Re_tmp = rho_res*vel_tmp*D_tub_m/mu_res
-            f_tmp = haaland_friction(Re_tmp, eps_m/D_tub_m)
-            dp_fric_tmp = f_tmp*(MD/D_tub_m)*(rho_res*vel_tmp**2/2)
-            FTHP_tmp = P_res_pa + sandface_loss + dp_fric_tmp - dP_hydro_flow
-            fthp_vals.append(from_pa(FTHP_tmp, pressure_unit))
+            q_vol_tmp = qv * 1000 / 86400 / rho_res
+            pressure_tmp = np.zeros(n_segments)
+            pressure_tmp[-1] = P_res_pa + sandface_loss
+            for i in range(n_segments-2, -1, -1):
+                dp_hydro = rho_res * G * dz_tvd[i]
+                vel_tmp = q_vol_tmp / A_tub
+                Re_tmp = rho_res * vel_tmp * D_tub_m / mu_res
+                f_tmp = haaland_friction(Re_tmp, eps_m/D_tub_m)
+                dp_fric_tmp = f_tmp * (dz_md[i]/D_tub_m) * (rho_res*vel_tmp**2/2)
+                pressure_tmp[i] = pressure_tmp[i+1] - dp_hydro - dp_fric_tmp
+            fthp_vals.append(from_pa(pressure_tmp[0], pressure_unit))
         fig2, ax2 = plt.subplots()
         ax2.plot(q_vals, fthp_vals, '-o', color='green')
         ax2.axvline(q_tpd, color='gray', linestyle='--')
@@ -144,8 +159,8 @@ if st.button("Calculate"):
     # --- CSV export ---
     df = pd.DataFrame({
         "TVD_m": tvd_nodes,
-        "Shut_in_Pressure_"+pressure_unit: from_pa(pressure_shut_profile, pressure_unit),
-        "Flowing_Pressure_"+pressure_unit: from_pa(pressure_flow_profile, pressure_unit),
+        "Flowing_Pressure_"+pressure_unit: from_pa(pressure_flow, pressure_unit),
+        "Shut_in_Pressure_"+pressure_unit: from_pa(np.linspace(P_res_pa - rho_res*G*TVD, P_res_pa, n_segments), pressure_unit)
     })
     st.download_button("Download CSV", data=df.to_csv(index=False).encode("utf-8"),
                        file_name="CO2_injection_profile.csv", mime="text/csv")
