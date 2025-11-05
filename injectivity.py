@@ -99,12 +99,11 @@ if st.button('Calculate'):
     dz_tvd = np.diff(tvd_nodes)
     T_profile_K = T_surf_K + (T_res_K - T_surf_K) * (tvd_nodes / TVD)
 
-    # --- Shut-in THP (static hydrostatic column) ---
+    # --- Shut-in THP (static hydrostatic) ---
     pressure_shut_profile = np.zeros(n_segments)
-    pressure_shut_profile[-1] = P_res_pa  # bottom = reservoir pressure
+    pressure_shut_profile[-1] = P_res_pa
     rho_shut = np.zeros(n_segments)
     mu_shut = np.zeros(n_segments)
-
     for i in range(n_segments-2, -1, -1):
         try:
             rho_loc = PropsSI('D','T',T_profile_K[i],'P',pressure_shut_profile[i+1],'CO2')
@@ -114,81 +113,130 @@ if st.button('Calculate'):
             mu_loc = mu_res
         rho_shut[i] = rho_loc
         mu_shut[i] = mu_loc
-        # shallower pressure = deeper pressure - rho*g*dz (hydrostatic drop upward)
         pressure_shut_profile[i] = pressure_shut_profile[i+1] - rho_loc * G * dz_tvd[i]
-
     THP_shut_pa = pressure_shut_profile[0]
 
-    # --- Flowing THP (mass-conserved, per-segment properties) ---
-    pressure_flow_profile = np.zeros(n_segments)
-    rho_flow = np.zeros(n_segments)
-    mu_flow = np.zeros(n_segments)
-    seg_friction_loss = np.zeros(n_segments-1)  # friction per segment
-    seg_hydrostatic = np.zeros(n_segments-1)
-
-    # Sandface loss (Darcy-style) - approximate using reservoir viscosity; units Pa
+    # --- Flowing THP with iterative sandface convergence ---
+    # initialization
+    max_iter = 50
+    tol_pa = 1e-3
+    # initial sandface guess using reservoir props (as before)
     try:
-        sandface_loss = (mu_res * (mass_flow_kg_s / rho_res)) / (2.0 * pi * perm_m2 * h_res) * (np.log(re / rw) + skin) if perm_m2 > 0.0 else 0.0
-        # Note: Above uses volumetric flow computed with reservoir density as a simple Darcy estimate.
-    except Exception:
-        sandface_loss = 0.0
+        q_vol_nominal = mass_flow_kg_s / rho_res
+        sandface_guess = (mu_res * q_vol_nominal) / (2.0 * pi * perm_m2 * h_res) * (np.log(re / rw) + skin) if perm_m2 > 0 else 0.0
+    except:
+        sandface_guess = 0.0
 
-    # Boundary condition: perforation (deepest node) flowing pressure must be reservoir pressure + sandface_loss
-    pressure_flow_profile[-1] = P_res_pa + sandface_loss
-    rho_flow[-1] = rho_res
-    mu_flow[-1] = mu_res
+    sandface = sandface_guess
+    prev_perf_pressure = None
 
-    # March upward from bottom to surface, conserving mass:
-    for i in range(n_segments-2, -1, -1):
-        # Use properties at deeper node pressure (i+1) as the starting estimate for this segment
+    for it in range(max_iter):
+        # set bottom (perforation) flowing pressure = reservoir + sandface
+        pressure_flow_profile = np.zeros(n_segments)
+        pressure_flow_profile[-1] = P_res_pa + sandface
+
+        rho_flow = np.zeros(n_segments)
+        mu_flow = np.zeros(n_segments)
+        seg_friction_loss = np.zeros(n_segments-1)
+        seg_hydrostatic = np.zeros(n_segments-1)
+
+        # set bottom node props using PropsSI at perforation conditions if possible
         try:
-            rho_loc = PropsSI('D','T',T_profile_K[i+1],'P',pressure_flow_profile[i+1],'CO2')
-            mu_loc = PropsSI('V','T',T_profile_K[i+1],'P',pressure_flow_profile[i+1],'CO2')
+            rho_flow[-1] = PropsSI('D','T',T_profile_K[-1],'P',pressure_flow_profile[-1],'CO2')
+            mu_flow[-1] = PropsSI('V','T',T_profile_K[-1],'P',pressure_flow_profile[-1],'CO2')
         except:
-            rho_loc = rho_res
-            mu_loc = mu_res
+            rho_flow[-1] = rho_res
+            mu_flow[-1] = mu_res
 
-        # local volumetric flow (m3/s) given mass flow (kg/s)
-        q_vol_local = mass_flow_kg_s / (rho_loc if rho_loc>0 else rho_res)
-        vel_loc = q_vol_local / A_tub
-        Re_loc = rho_loc * vel_loc * D_tub_m / (mu_loc if mu_loc>0 else 1e-12)
-        f_loc = haaland_friction(Re_loc, eps_m / D_tub_m) if Re_loc>0 else np.nan
+        # march upward conserving mass: q_vol_local = mass_flow / rho_loc (rho at segment deeper node)
+        for i in range(n_segments-2, -1, -1):
+            # use properties at deeper node (i+1) to evaluate losses over the segment
+            rho_loc = rho_flow[i+1]
+            mu_loc = mu_flow[i+1]
+            if rho_loc == 0 or np.isnan(rho_loc):
+                rho_loc = rho_res
+            if mu_loc == 0 or np.isnan(mu_loc):
+                mu_loc = mu_res
 
-        # frictional pressure loss over this MD segment (Pa)
-        dp_f = f_loc * (dz_md[i] / D_tub_m) * (rho_loc * vel_loc**2 / 2.0)
-        dp_h = rho_loc * G * dz_tvd[i]
+            q_vol_local = mass_flow_kg_s / (rho_loc if rho_loc>0 else rho_res)
+            vel_loc = q_vol_local / A_tub
+            Re_loc = rho_loc * vel_loc * D_tub_m / (mu_loc if mu_loc>0 else 1e-12)
+            f_loc = haaland_friction(Re_loc, eps_m / D_tub_m) if Re_loc>0 else np.nan
 
-        seg_friction_loss[i] = dp_f
-        seg_hydrostatic[i] = dp_h
+            dp_f = f_loc * (dz_md[i] / D_tub_m) * (rho_loc * vel_loc**2 / 2.0)
+            dp_h = rho_loc * G * dz_tvd[i]
 
-        # marching upward: shallower pressure = deeper pressure - hydrostatic - friction
-        pressure_flow_profile[i] = pressure_flow_profile[i+1] - dp_h - dp_f
+            seg_friction_loss[i] = dp_f
+            seg_hydrostatic[i] = dp_h
 
-        # store properties at the shallower node for CSV/plot completeness (we'll estimate at node i using node i+1 props)
-        rho_flow[i] = rho_loc
-        mu_flow[i] = mu_loc
+            # marching upward: shallower pressure = deeper pressure - hydrostatic - friction
+            pressure_flow_profile[i] = pressure_flow_profile[i+1] - dp_h - dp_f
 
-    THP_flow_pa = pressure_flow_profile[0]
+            # estimate properties at the shallower node (i) using pressure just computed there
+            try:
+                rho_flow[i] = PropsSI('D','T',T_profile_K[i],'P',pressure_flow_profile[i],'CO2')
+                mu_flow[i] = PropsSI('V','T',T_profile_K[i],'P',pressure_flow_profile[i],'CO2')
+            except:
+                rho_flow[i] = rho_res
+                mu_flow[i] = mu_res
 
-    # --- Quick numerical test: perforation BHP vs expected (P_res + sandface_loss) ---
-    perforation_bhp_pa = pressure_flow_profile[-1]
-    expected_bottom_pa = P_res_pa + sandface_loss
-    tol = 1e-6  # tiny tolerance
-    if perforation_bhp_pa + tol >= expected_bottom_pa:
-        st.success(f'Perforation BHP check: OK. BHP_perforation = {from_pa(perforation_bhp_pa, pressure_unit):.4f} {pressure_unit} >= P_res + sandface_loss = {from_pa(expected_bottom_pa, pressure_unit):.4f} {pressure_unit}')
+        THP_flow_pa = pressure_flow_profile[0]
+
+        # recompute sandface using the bottom node local properties (use bottom mu and bottom rho)
+        rho_bottom = rho_flow[-1] if rho_flow[-1]>0 else rho_res
+        mu_bottom = mu_flow[-1] if mu_flow[-1]>0 else mu_res
+        q_vol_bottom = mass_flow_kg_s / rho_bottom
+        try:
+            sandface_new = (mu_bottom * q_vol_bottom) / (2.0 * pi * perm_m2 * h_res) * (np.log(re / rw) + skin) if perm_m2 > 0 else 0.0
+        except:
+            sandface_new = sandface
+
+        # check convergence on perforation pressure (or sandface)
+        perf_pressure = pressure_flow_profile[-1]
+        if prev_perf_pressure is not None and abs(perf_pressure - prev_perf_pressure) < tol_pa:
+            sandface = sandface_new
+            break
+
+        prev_perf_pressure = perf_pressure
+        sandface = sandface_new
     else:
-        st.warning(f'Perforation BHP check: FAILED. BHP_perforation = {from_pa(perforation_bhp_pa, pressure_unit):.4f} {pressure_unit} < P_res + sandface_loss = {from_pa(expected_bottom_pa, pressure_unit):.4f} {pressure_unit}. Difference = {from_pa(expected_bottom_pa - perforation_bhp_pa, pressure_unit):.4f} {pressure_unit}')
+        st.warning(f'Sandface iteration did not fully converge in {max_iter} iters (last diff = {abs(perf_pressure - prev_perf_pressure):.3f} Pa)')
 
-    # Display results
-    st.subheader('Results')
-    st.write(f'Flowing THP = {from_pa(THP_flow_pa,pressure_unit):.4f} {pressure_unit}')
-    st.write(f'Shut-in THP = {from_pa(THP_shut_pa,pressure_unit):.4f} {pressure_unit}')
-    st.write(f'Sandface loss (Pa) = {sandface_loss:.2f} Pa ({from_pa(sandface_loss,pressure_unit):.4f} {pressure_unit})')
+    # totals for reporting
+    total_friction = np.nansum(seg_friction_loss)
+    total_hydro_shut = np.nansum([rho_shut[i]*G*dz_tvd[i] for i in range(n_segments-1)])
+    total_hydro_flow = np.nansum(seg_hydrostatic)
+    hydro_diff = total_hydro_shut - total_hydro_flow
 
-    # --- Pressure vs Depth plot ---
+    # compute difference THP_flow - THP_shut
+    thp_diff_pa = THP_flow_pa - THP_shut_pa
+
+    # Show numeric breakdown
+    st.subheader("Pressure breakdown (surface-referenced)")
+    st.write(f"Flowing THP = {from_pa(THP_flow_pa, pressure_unit):.6f} {pressure_unit}")
+    st.write(f"Shut-in THP = {from_pa(THP_shut_pa, pressure_unit):.6f} {pressure_unit}")
+    st.write(f"THP_flow - THP_shut = {from_pa(thp_diff_pa, pressure_unit):.6f} {pressure_unit}")
+    st.write("---")
+    st.write(f"Sandface loss (Pa) = {sandface:.3f} Pa ({from_pa(sandface, pressure_unit):.6f} {pressure_unit})")
+    st.write(f"Total frictional loss up the tubing (Pa) = {total_friction:.3f} Pa ({from_pa(total_friction, pressure_unit):.6f} {pressure_unit})")
+    st.write(f"Total hydrostatic (shut-in) (Pa) = {total_hydro_shut:.3f} Pa ({from_pa(total_hydro_shut, pressure_unit):.6f} {pressure_unit})")
+    st.write(f"Total hydrostatic (flowing) (Pa) = {total_hydro_flow:.3f} Pa ({from_pa(total_hydro_flow, pressure_unit):.6f} {pressure_unit})")
+    st.write(f"Hydrostatic difference (shut - flow) (Pa) = {hydro_diff:.3f} Pa ({from_pa(hydro_diff, pressure_unit):.6f} {pressure_unit})")
+
+    # Final sanity check
+    if thp_diff_pa >= -1e-6:
+        st.success("Flowing THP >= Shut-in THP (as expected for injection).")
+    else:
+        st.error("Flowing THP < Shut-in THP — still inconsistent. See breakdown above to diagnose.")
+        # Suggest likely causes
+        st.write("- If total frictional loss > sandface + hydrostatic difference, that explains the result.")
+        st.write("- Check permeability/skin/flow rate; if very high friction (tiny ID or extremely high rate) friction may dominate.")
+        st.write("- If the sandface model is inappropriate for your reservoir (non-Darcy, multi-phase, or partial penetration), include a tailored IPR or iterative well/reservoir coupling.")
+
+    # Plot and CSV export (same as before)
     fig, ax = plt.subplots(figsize=(5,8))
-    ax.plot(from_pa(pressure_flow_profile,pressure_unit), tvd_nodes, label='Flowing THP', color='blue')
-    ax.plot(from_pa(pressure_shut_profile,pressure_unit), tvd_nodes, linestyle='--', label='Shut-in THP', color='red')
+    ax.plot(from_pa(pressure_flow_profile,pressure_unit), tvd_nodes, label='Flowing THP')
+    ax.plot(from_pa(pressure_shut_profile,pressure_unit), tvd_nodes, linestyle='--', label='Shut-in THP')
     ax.set_xlabel(f'Pressure ({pressure_unit})')
     ax.set_ylabel('TVD (m)')
     ax.invert_yaxis()
@@ -196,39 +244,7 @@ if st.button('Calculate'):
     ax.legend()
     st.pyplot(fig)
 
-    # Sensitivity (approximate friction using reservoir properties but mass-conserved)
-    if show_sensitivity:
-        q_vals = np.linspace(0.5*q_tpd, 2.0*q_tpd, 20)
-        thp_vals = []
-        for qv in q_vals:
-            mass_flow_tmp = qv * 1000.0 / 86400.0
-            # approximate sandface with reservoir viscosity & local q_vol estimate
-            try:
-                q_vol_tmp = mass_flow_tmp / rho_res
-                sandface_tmp = (mu_res * q_vol_tmp) / (2.0 * pi * perm_m2 * h_res) * (np.log(re / rw) + skin) if perm_m2 > 0.0 else 0.0
-            except:
-                sandface_tmp = sandface_loss
-
-            # approximate friction sum across segments using reservoir props for speed
-            vel_tmp = q_vol_tmp / A_tub
-            friction_tmp = 0.0
-            for j in range(n_segments-1):
-                Re_tmp = rho_res * vel_tmp * D_tub_m / (mu_res if mu_res>0 else 1e-12)
-                f_tmp = haaland_friction(Re_tmp, eps_m / D_tub_m)
-                friction_tmp += f_tmp * (dz_md[j] / D_tub_m) * (rho_res * vel_tmp**2 / 2.0)
-
-            thp_guess = THP_shut_pa + friction_tmp + sandface_tmp
-            thp_vals.append(from_pa(thp_guess, pressure_unit))
-
-        fig2, ax2 = plt.subplots()
-        ax2.plot(q_vals, thp_vals, '-o')
-        ax2.axvline(q_tpd, color='gray', linestyle='--')
-        ax2.set_xlabel('Injection rate (t/d)')
-        ax2.set_ylabel(f'THP ({pressure_unit})')
-        ax2.grid(True)
-        st.pyplot(fig2)
-
-    # --- CSV export ---
+    # CSV export includes segment losses
     df_profile = pd.DataFrame({
         'MD_m': md_nodes,
         'TVD_m': tvd_nodes,
@@ -242,9 +258,9 @@ if st.button('Calculate'):
     })
 
     summary = pd.DataFrame({
-        'Parameter': ['Flowing THP','Shut-in THP','Sandface loss (user calc)'],
-        'Value': [from_pa(THP_flow_pa, pressure_unit), from_pa(THP_shut_pa, pressure_unit), from_pa(sandface_loss, pressure_unit)],
-        'Unit':[pressure_unit]*3
+        'Parameter': ['Flowing THP','Shut-in THP','Sandface loss (Pa)','Total friction (Pa)','Hydrostatic diff (Pa)'],
+        'Value': [THP_flow_pa, THP_shut_pa, sandface, total_friction, hydro_diff],
+        'Unit': ['Pa']*5
     })
 
     csv_buf = df_profile.to_csv(index=False) + '\n\n' + summary.to_csv(index=False)
@@ -255,3 +271,4 @@ if st.button('Calculate'):
 # Footer
 st.markdown("---")
 st.markdown("© 2025 CCS Energy Pty Ltd. www.ccsenergy.com.au All rights reserved. info@ccsenergy.com.au")
+
