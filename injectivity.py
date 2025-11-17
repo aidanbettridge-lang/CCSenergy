@@ -10,7 +10,7 @@ from CoolProp.CoolProp import PropsSI
 # =====================================
 st.set_page_config(page_title="CO₂ Injection — THP Estimator", layout="wide")
 st.image("https://ccsenergy.com.au/wp-content/themes/custom-theme/assets/images/logo.svg", width=250)
-st.title("CO₂ Injection — Tubing Head Pressure Estimator")
+st.title("CO₂ Injection Well Pressure & Temperature Estimator")
 
 # =====================================
 # CONSTANTS & HELPER FUNCTIONS
@@ -253,5 +253,6 @@ if st.button("Calculate"):
 # =====================================
 st.markdown("---")
 st.markdown("© 2025 CCS Energy Pty Ltd. All rights reserved. info@ccsenergy.com.au")
+
 
 
